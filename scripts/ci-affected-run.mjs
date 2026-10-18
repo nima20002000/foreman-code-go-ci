@@ -1,6 +1,5 @@
-import { execFileSync, spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, matchesGlob, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -127,30 +126,7 @@ function reportedCommand(command, report) {
     `--test-reporter-destination=${report}`] : [argument])
 }
 
-function recordNativeInput(session, selector, selectionFile) {
-  const checkoutCommit = execFileSync('git', ['rev-parse', '--verify', 'HEAD^{commit}'],
-    { cwd: repositoryRoot, encoding: 'utf8' }).trim()
-  const transportSnapshotCommit = process.env.CI_SELECTION_COMMIT || null
-  if (transportSnapshotCommit && !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(transportSnapshotCommit)) {
-    throw new Error('The native adapter transport snapshot identity is invalid.')
-  }
-  const digest = bytes => createHash('sha256').update(bytes).digest('hex')
-  const bytes = readFileSync(resolve(repositoryRoot, selectionFile))
-  const dispatchPath = join(repositoryRoot, 'ci-dispatch-inputs.json')
-  let dispatchInputs
-  if (transportSnapshotCommit && existsSync(dispatchPath)) {
-    const dispatchBytes = readFileSync(dispatchPath)
-    if (JSON.parse(dispatchBytes).commit !== transportSnapshotCommit) throw new Error('Native dispatch snapshot identity mismatch.')
-    dispatchInputs = { sha256: digest(dispatchBytes) }
-  }
-  writeFileSync(join(session, 'native-input.json'), `${JSON.stringify({ schemaVersion: 1, selector,
-    checkoutCommit, transportSnapshotCommit,
-    forkSourceBinding: 'Foreman CI run provenance.sourceCommit',
-    selection: { sha256: digest(bytes), request: JSON.parse(bytes) }, ...(dispatchInputs ? { dispatchInputs } : {}),
-  })}\n`, { mode: 0o600, flag: 'wx' })
-}
-
-async function runReported(command, request, directory, selectionFile) {
+async function runReported(command, request, directory) {
   const argument = command.includes('--test') ? command.at(-1) : undefined
   const selector = argument && (isAbsolute(argument) ? relative(repositoryRoot, argument) : argument)
   const binding = request.nativeReports[selector]
@@ -161,8 +137,6 @@ async function runReported(command, request, directory, selectionFile) {
   const environment = { CI_REPOSITORY_ROOT: repositoryRoot }
   if (binding) {
     await expectNativeReports({ directory: session, selector, ...binding })
-    // These are provenance facts, not routing variables forwarded to the selected child.
-    recordNativeInput(session, selector, selectionFile)
     environment.CI_NATIVE_REPORTS_DIR = session
     environment.CI_NATIVE_SELECTOR = selector
     environment.CI_STATE = join(session, 'suite-state')
@@ -205,7 +179,7 @@ export async function executeAffected(suite, selection) {
   for (const [index, command] of commands.entries()) {
     try {
       const result = ['unit', 'integration'].includes(suite)
-        ? await runReported(command, request, join(resolve(process.env.CI_STATE), 'affected', String(index)), selection)
+        ? await runReported(command, request, join(resolve(process.env.CI_STATE), 'affected', String(index)))
         : { status: await run(command) }
       if (!code) code = result.status
       if (result.report) reports.push(result.report)

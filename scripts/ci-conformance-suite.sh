@@ -49,7 +49,7 @@ ci_conformance_test() {
   local events="$directory/$target.jsonl" errors="$directory/$target.stderr.log"
   local inventory_errors="$directory/$target.inventory.stderr.log" status="$directory/$target.action-status.json"
   local selected_ids="$directory/$target.selection.json" selected_arguments="$directory/$target.selection-arguments"
-  local statuses=() gate_arguments=() scenario_ids=() launcher_arguments=() main_input='' id='' selected_targets=''
+  local statuses=() gate_arguments=() scenario_ids=() launcher_arguments=() main_input='' id='' ts_required=''
   case "$target" in go|ts) ;; *) echo 'Conformance target must be go or ts.' >&2; return 2 ;; esac
   if [ -z "$selection" ] && { [ "${SCOPE:-}" != full ] || [ "${FOREMAN_CODE_CI_RELEASE:-}" != 1 ]; }; then
     echo 'Conformance execution requires exact affected scenario IDs or explicit release scope.' >&2
@@ -64,11 +64,10 @@ ci_conformance_test() {
     "$inventory_errors" "$status" "$selected_ids" "$selected_arguments" || return $?
   if [ -n "$selection" ]; then
     node scripts/ci-affected-scope.mjs conformance-selection "$selection" "$selected_ids" > "$selected_arguments" || return $?
-    selected_targets="$(node scripts/ci-affected-scope.mjs conformance-targets "$selection")" || return $?
-    case " $selected_targets " in
-      *" $target "*) ;;
-      *) echo "The affected conformance request does not select the $target target." >&2; return 2 ;;
-    esac
+    if [ "$target" = ts ]; then
+      ts_required="$(node scripts/ci-affected-scope.mjs conformance-ts-required "$selection")" || return $?
+      if [ "$ts_required" != 1 ]; then echo 'The affected conformance request does not require the TS target.' >&2; return 2; fi
+    fi
     mapfile -d '' -t scenario_ids < "$selected_arguments" || return $?
     if [ "${#scenario_ids[@]}" = 0 ]; then echo 'Zero requested conformance scenario IDs.' >&2; return 2; fi
     for id in "${scenario_ids[@]}"; do launcher_arguments+=(--scenario "$id"); done
@@ -77,7 +76,7 @@ ci_conformance_test() {
   reports+=("$report")
 
   # The full inventory is metadata for validating the exact executed selection, not a full scenario run.
-  CONFORMANCE_TARGET="$target" pnpm --silent --dir conformance run conformance --target "$target" --list \
+  CONFORMANCE_TARGET="$target" pnpm --silent --dir conformance run conformance --list \
     > "$inventory" 2> "$inventory_errors" || inventory_code=$?
   (
     # Q-CONF initializes its own cluster per scenario; it must never reuse the Go integration database.
@@ -86,7 +85,7 @@ ci_conformance_test() {
     unset PGHOST PGHOSTADDR PGPORT PGDATABASE PGUSER PGPASSWORD PGSERVICE PGSERVICEFILE PGPASSFILE
     export CONFORMANCE_TARGET="$target" CONFORMANCE_RESULTS_FILE="$input"
     export CONFORMANCE_GO_BINARY="$state/bin/foreman"
-    pnpm --silent --dir conformance run conformance --target "$target" "${launcher_arguments[@]}"
+    pnpm --silent --dir conformance run conformance "${launcher_arguments[@]}"
   ) 2> "$errors" | tee "$events"
   statuses=("${PIPESTATUS[@]}")
   launcher_code="${statuses[0]}"
