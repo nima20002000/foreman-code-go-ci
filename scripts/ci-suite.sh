@@ -7,7 +7,8 @@ set -euo pipefail
 case "${SUITE:-}" in
   unit|unit-*)
     case "${1:-}" in start|prepare|cleanup) exit 0 ;; esac
-    exec node "$(dirname "$0")/ci-go-regressions.mjs"
+    echo "Schema qualification requires its explicit affected dispatcher" >&2
+    exit 1
     ;;
 esac
 umask 077
