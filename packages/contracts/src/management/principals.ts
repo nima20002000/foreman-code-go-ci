@@ -1,6 +1,5 @@
 import { z } from 'zod'
 import { IdSchema, TimestampSchema } from '../schemaPrimitives.js'
-import { withConditionalPresence } from '../goContractRules.js'
 
 const ManagementAudienceSchema = z.enum(["operator", "worker", "user"]);
 export type ManagementAudience = z.infer<typeof ManagementAudienceSchema>;
@@ -92,10 +91,10 @@ export type ManagementGrant = z.infer<typeof ManagementGrantSchema>;
 /** Timestamp representation for credentials whose lifetime ends only on revocation. */
 export const NON_EXPIRING_CREDENTIAL_TIMESTAMP = '9999-12-31T23:59:59.999Z'
 
-export const ManagementPrincipalSchema = withConditionalPresence(z
+export const ManagementPrincipalSchema = z
   .object({
     id: IdSchema,
-    name: IdSchema,
+    name: z.string().trim().min(1),
     audience: ManagementAudienceSchema,
     /** Immutable backend-issued logical Agent subject for worker/App principals. */
     agentId: IdSchema.optional(),
@@ -103,13 +102,13 @@ export const ManagementPrincipalSchema = withConditionalPresence(z
     expiresAt: TimestampSchema.describe('Credential expiry; 9999-12-31T23:59:59.999Z means no expiry.'),
     revokedAt: TimestampSchema.nullable(),
   })
-  .strict(), [{
-    kind: 'conditionalPresence',
-    discriminator: 'audience',
-    equals: 'worker',
-    field: 'agentId',
-    presence: 'truthy',
-    requiredMessage: 'worker principals require an immutable Agent subject',
-    forbiddenMessage: 'Operator principals do not impersonate board Agents',
-  }]);
+  .strict()
+  .superRefine((value, context) => {
+    if (value.audience === "worker" && !value.agentId) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["agentId"], message: "worker principals require an immutable Agent subject" });
+    }
+    if (value.audience !== "worker" && value.agentId) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["agentId"], message: "Operator principals do not impersonate board Agents" });
+    }
+  });
 export type ManagementPrincipal = z.infer<typeof ManagementPrincipalSchema>;
