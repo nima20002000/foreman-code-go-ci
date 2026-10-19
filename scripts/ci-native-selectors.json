@@ -3,8 +3,8 @@
     "suite": "integration",
     "selection": "conformance/ci/ts-reference-selection.json"
   },
-  "scripts/fixtures/go-snapshot-race/behavior.test.mjs": {
+  "scripts/fixtures/go-provider-status-race/behavior.test.mjs": {
     "suite": "unit-api",
-    "selection": "scripts/fixtures/go-snapshot-race/behavior-plan.json"
+    "selection": "scripts/fixtures/go-provider-status-race/behavior-plan.json"
   }
 }
