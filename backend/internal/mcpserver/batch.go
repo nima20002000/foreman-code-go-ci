@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -24,6 +25,9 @@ type batchMessage struct {
 	method        string
 	requestedTool string
 	call          bool
+	notification  bool
+	initialize    bool
+	cancelID      []byte
 }
 
 // serveBatch adapts only the batch envelope. Each member still goes through the
@@ -38,97 +42,157 @@ func (r *Registry) serveBatch(w http.ResponseWriter, request *http.Request, body
 		_, err := io.WriteString(w, `{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error: Invalid JSON-RPC message"},"id":null}`)
 		return err
 	}
+	for _, message := range messages {
+		if message.initialize && len(messages) > 1 {
+			w.Header().Set("Content-Type", "application/json")
+			accept := request.Header.Get("Accept")
+			if !strings.Contains(accept, "application/json") || !strings.Contains(accept, "text/event-stream") {
+				w.WriteHeader(http.StatusNotAcceptable)
+				_, err := io.WriteString(w, `{"jsonrpc":"2.0","error":{"code":-32000,"message":"Not Acceptable: Client must accept both application/json and text/event-stream"},"id":null}`)
+				return err
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, err := io.WriteString(w, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request: Only one initialization request is allowed"},"id":null}`)
+			return err
+		}
+	}
 
-	// At the negotiated 2025-11-25 version the SDK detaches handler contexts.
-	// Bind both serverFor/authorized and the HTTP clones to this derived context
-	// so cancellation and failed response writes reach this batch's tools only.
-	ctx, cancel := context.WithCancel(request.Context())
-	defer cancel()
-	output := &batchOutput{writer: w, ctx: ctx, cancel: cancel}
+	return r.runBatch(w, request, messages)
+}
+
+func (r *Registry) runBatch(w http.ResponseWriter, request *http.Request, messages []batchMessage) error {
+	// Follow caller cancellation while its response is pending. Once all public
+	// response slots are filled, an older overwritten duplicate controller can
+	// outlive the frozen server's close. Keep its SDK handler alive to finish.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(request.Context()))
+	output := newBatchOutput(w, ctx, cancel, messages)
+	stopCancellation := context.AfterFunc(request.Context(), output.cancelRequest)
+	output.stopCancellation = stopCancellation
+	pendingDone := make(chan struct{})
+	byID := make(map[string]*batchCall)
+	defer func() {
+		stopCancellation()
+		if output.finished() {
+			// Foreman's frozen HTTP close closes the server. Protocol close
+			// aborts the controller still mapped by public ID, while an older
+			// overwritten controller is no longer in that map.
+			for _, call := range byID {
+				if !call.handlerFinished.Load() {
+					call.abort()
+				}
+			}
+			go func() { <-pendingDone; cancel() }()
+		} else {
+			cancel()
+		}
+	}()
 	handlers := make([]*mcp.StreamableHTTPHandler, len(messages))
+	calls := make([]*batchCall, len(messages))
+	replies := make([]*batchMemberWriter, len(messages))
+	var admissions sync.WaitGroup
+	admissions.Add(len(messages))
+	admissionsDone := make(chan struct{})
 	for i, message := range messages {
-		server, err := r.serverFor(ctx, message.requestedTool)
+		toolContext := ctx
+		if message.call {
+			calls[i] = newBatchCall(ctx)
+			toolContext = calls[i].ctx
+		}
+		server, err := r.serverFor(toolContext, message.requestedTool)
 		if err != nil {
 			return err
 		}
 		if message.call {
 			addBatchMethodFallback(server, message.method)
 		}
+		if message.call && batchHasController(message.method) {
+			// The frozen protocol registers controllers before notification
+			// microtasks, with the last controller winning a duplicate ID.
+			// Its tool-only server has fewer handlers than the Go method table.
+			byID[string(message.id)] = calls[i]
+		}
+		reply := &batchMemberWriter{
+			header: make(http.Header), output: output, id: message.id,
+			call: calls[i], admissionsDone: admissionsDone, admitted: admissions.Done,
+			unregistered: message.call && !batchHasController(message.method),
+		}
+		replies[i] = reply
+		server.AddReceivingMiddleware(reply.receivingMiddleware)
 		handlers[i] = r.streamableHandler(server)
 	}
 
 	// The frozen TS transport dispatches without awaiting earlier members.
-	// SSE therefore streams completions; explicit JSON uses the input slots.
-	replies := make([]*batchMemberWriter, len(messages))
+	// SSE streams completions; JSON uses distinct public IDs in input order.
 	var pending sync.WaitGroup
+	var notifications sync.WaitGroup
 	for i, message := range messages {
-		reply := &batchMemberWriter{header: make(http.Header), output: output, id: message.id}
-		replies[i] = reply
+		reply := replies[i]
 		memberRequest := request.Clone(ctx)
 		memberRequest.Body = io.NopCloser(bytes.NewReader(message.body))
 		memberRequest.ContentLength = int64(len(message.body))
 		memberRequest.GetBody = nil
 		pending.Add(1)
+		if message.notification {
+			notifications.Add(1)
+		}
 		go func() {
 			defer pending.Done()
+			defer reply.finishAdmission(message)
+			if message.notification {
+				defer notifications.Done()
+			}
 			handlers[i].ServeHTTP(reply, memberRequest)
+			if reply.unregisteredDispatchError(message) {
+				reply.writeMethodNotFound(r.opts.JSONResponse)
+			}
+			// Keep the real HTTP transport alive. This cancellation signal is
+			// for the selected tool only, after the SDK admits the notification.
+			if reply.status == http.StatusAccepted && len(message.cancelID) > 0 {
+				if call := byID[string(message.cancelID)]; call != nil {
+					call.abort()
+				}
+			}
 		}()
 	}
-	pending.Wait()
-	if err := output.failure(); err != nil {
+	go func() { pending.Wait(); close(pendingDone) }()
+	admissions.Wait()
+	notifications.Wait()
+	for i, reply := range replies {
+		if reply.admissionError != nil {
+			return reply.admissionError.write(w, messages[i].id)
+		}
+	}
+	// Every member has passed the official HTTP gates or returned its exact
+	// ignored-notification result. Cancellation notifications are applied before
+	// a final response can be published, matching frozen Promise continuations.
+	close(admissionsDone)
+	select {
+	case <-ctx.Done():
+		return output.failure()
+	case <-output.done:
+		return nil
+	case <-pendingDone:
+	}
+	if err := output.failure(); err != nil || ctx.Err() != nil || output.finished() {
 		return err
 	}
-	if ctx.Err() != nil {
-		return nil
-	}
-
 	for i, reply := range replies {
-		if reply.status >= http.StatusBadRequest {
-			// SDK HTTP admission errors (for example a shared invalid protocol
-			// header) retain the SDK response. A committed stream cannot carry a
-			// second HTTP response; net/http's abort sentinel closes that stream.
+		if reply.status >= http.StatusBadRequest && !reply.ignoredNotification(messages[i]) {
+			// Retain a post-dispatch SDK HTTP error too. Once SSE has started,
+			// net/http's abort sentinel prevents a fabricated second response.
 			if output.started {
 				panic(http.ErrAbortHandler)
 			}
-			data := reply.body.Bytes()
-			if strings.HasPrefix(reply.header.Get("Content-Type"), "application/json") {
-				var err error
-				data, err = restoreBatchResponseID(data, messages[i].id)
-				if err != nil {
-					return err
-				}
-			}
-			copyBatchHeaders(w.Header(), reply.header)
-			w.WriteHeader(reply.status)
-			_, err := w.Write(data)
-			return err
+			failure := &batchHTTPError{header: reply.header, status: reply.status, body: reply.body.Bytes()}
+			return failure.write(w, messages[i].id)
 		}
 	}
-
-	if r.opts.JSONResponse {
-		var results [][]byte
-		for i, reply := range replies {
-			if !messages[i].call || reply.status == http.StatusAccepted {
-				continue
-			}
-			result, err := restoreBatchResponseID(reply.body.Bytes(), messages[i].id)
-			if err != nil {
-				return err
-			}
-			results = append(results, result)
-		}
-		if len(results) > 0 {
-			w.Header().Set("Content-Type", "application/json")
-			var data []byte
-			if len(results) == 1 {
-				data = results[0]
-			} else {
-				data = append([]byte{'['}, bytes.Join(results, []byte{','})...)
-				data = append(data, ']')
-			}
-			_, err := w.Write(data)
-			return err
-		}
+	if output.cancelledSlotPending(messages, calls) {
+		// An aborted unique public ID has no response. Another completion with
+		// that same ID can fill the slot; otherwise the real HTTP peer must end
+		// the pending JSON response or SSE stream itself.
+		<-ctx.Done()
+		return output.failure()
 	}
 	if !output.started {
 		w.WriteHeader(http.StatusAccepted)
@@ -181,12 +245,17 @@ func parseBatch(body []byte) ([]batchMessage, bool) {
 		// Other valid JSON-RPC kinds have no requested tool to expose.
 		_ = json.Unmarshal(raw[i], &transport)
 		message.method = transport.Method
+		message.initialize = batchInitialize(fields)
 		if transport.Method == "tools/call" {
 			message.requestedTool = transport.Params.Name
 		}
 		_, hasMethod := fields["method"]
 		id, hasID := fields["id"]
 		message.call = hasMethod && hasID
+		message.notification = hasMethod && !hasID
+		if message.notification {
+			message.cancelID = batchCancellationID(fields)
+		}
 		if message.call {
 			message.id, ok = batchID(id)
 			if !ok {
@@ -385,26 +454,128 @@ func restoreBatchResponseID(data, id []byte) ([]byte, error) {
 }
 
 type batchOutput struct {
-	writer  http.ResponseWriter
-	ctx     context.Context
-	cancel  context.CancelFunc
-	mu      sync.Mutex
-	started bool
-	err     error
+	writer           http.ResponseWriter
+	ctx              context.Context
+	cancel           context.CancelFunc
+	stopCancellation func() bool
+	mu               sync.Mutex
+	started          bool
+	complete         bool
+	delivery         atomic.Uint32
+	err              error
+	ids              []string
+	responses        map[string][]byte
+	received         int
+	done             chan struct{}
 }
 
-func (output *batchOutput) write(header http.Header, data []byte) error {
+func newBatchOutput(w http.ResponseWriter, ctx context.Context, cancel context.CancelFunc, messages []batchMessage) *batchOutput {
+	output := &batchOutput{
+		writer: w, ctx: ctx, cancel: cancel,
+		responses: make(map[string][]byte), done: make(chan struct{}),
+	}
+	for _, message := range messages {
+		if !message.call {
+			continue
+		}
+		id := string(message.id)
+		if _, exists := output.responses[id]; !exists {
+			output.ids = append(output.ids, id)
+			output.responses[id] = nil
+		}
+	}
+	return output
+}
+
+func (output *batchOutput) write(header http.Header, data, id []byte, final bool) error {
 	output.mu.Lock()
 	defer output.mu.Unlock()
+	if output.complete {
+		return io.ErrClosedPipe
+	}
 	if output.err != nil {
 		return output.err
 	}
 	if err := output.ctx.Err(); err != nil {
 		return err
 	}
+	finishes := false
+	if final {
+		finishes = output.recordResponseLocked(string(id), data)
+	}
+	if err := output.writeLocked(header, data); err != nil {
+		return err
+	}
+	if finishes {
+		if err := output.flushLocked(); err != nil {
+			return err
+		}
+		return output.retireLocked()
+	}
+	return nil
+}
+
+// Frozen JSON response slots use public Map keys: insertion order is the first
+// occurrence of an ID, and a later response replaces that ID's earlier value
+// while other distinct IDs are pending. SSE still emits every such completion.
+func (output *batchOutput) writeJSON(id, data []byte) error {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	if output.complete {
+		return io.ErrClosedPipe
+	}
+	if output.err != nil {
+		return output.err
+	}
+	if err := output.ctx.Err(); err != nil {
+		return err
+	}
+	if !output.recordResponseLocked(string(id), data) {
+		return nil
+	}
+	results := make([][]byte, 0, len(output.ids))
+	for _, id := range output.ids {
+		results = append(results, output.responses[id])
+	}
+	body := results[0]
+	if len(results) > 1 {
+		body = append([]byte{'['}, bytes.Join(results, []byte{','})...)
+		body = append(body, ']')
+	}
+	if err := output.writeLocked(http.Header{"Content-Type": {"application/json"}}, body); err != nil {
+		return err
+	}
+	return output.retireLocked()
+}
+
+func (output *batchOutput) retireLocked() error {
+	// A caller disconnect and successful final delivery have one ordering. The
+	// caller path never waits for the writer mutex, so a stalled Write or Flush
+	// cannot keep live tool contexts from observing a real HTTP cancellation.
+	if !output.delivery.CompareAndSwap(0, 1) {
+		output.cancel()
+		return context.Canceled
+	}
+	output.complete = true
+	output.stopCancellation()
+	close(output.done)
+	return nil
+}
+
+func (output *batchOutput) recordResponseLocked(id string, data []byte) bool {
+	if output.responses[id] == nil {
+		output.received++
+	}
+	output.responses[id] = append([]byte(nil), data...)
+	return output.received == len(output.responses)
+}
+
+func (output *batchOutput) writeLocked(header http.Header, data []byte) error {
 	if !output.started {
 		copyBatchHeaders(output.writer.Header(), header)
-		output.writer.Header().Set("X-Accel-Buffering", "no")
+		if strings.HasPrefix(header.Get("Content-Type"), "text/event-stream") {
+			output.writer.Header().Set("X-Accel-Buffering", "no")
+		}
 		output.started = true
 	}
 	n, err := output.writer.Write(data)
@@ -413,6 +584,7 @@ func (output *batchOutput) write(header http.Header, data []byte) error {
 	}
 	if err != nil {
 		output.err = err
+		output.delivery.CompareAndSwap(0, 2)
 		output.cancel()
 	}
 	return err
@@ -421,16 +593,47 @@ func (output *batchOutput) write(header http.Header, data []byte) error {
 func (output *batchOutput) flush() error {
 	output.mu.Lock()
 	defer output.mu.Unlock()
-	if output.err != nil || !output.started {
+	if output.err != nil || !output.started || output.complete {
 		return output.err
 	}
+	if err := output.ctx.Err(); err != nil {
+		return err
+	}
+	return output.flushLocked()
+}
+
+func (output *batchOutput) flushLocked() error {
 	err := http.NewResponseController(output.writer).Flush()
 	if err != nil && !errors.Is(err, http.ErrNotSupported) {
 		output.err = err
+		output.delivery.CompareAndSwap(0, 2)
 		output.cancel()
 		return err
 	}
 	return nil
+}
+
+func (output *batchOutput) finished() bool {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	return output.complete
+}
+
+func (output *batchOutput) cancelRequest() {
+	if output.delivery.CompareAndSwap(0, 2) {
+		output.cancel()
+	}
+}
+
+func (output *batchOutput) cancelledSlotPending(messages []batchMessage, calls []*batchCall) bool {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	for i, call := range calls {
+		if call != nil && call.cancelled.Load() && output.responses[string(messages[i].id)] == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (output *batchOutput) failure() error {
@@ -444,17 +647,24 @@ func (output *batchOutput) fail(err error) error {
 	defer output.mu.Unlock()
 	if output.err == nil {
 		output.err = err
+		output.delivery.CompareAndSwap(0, 2)
 		output.cancel()
 	}
 	return output.err
 }
 
 type batchMemberWriter struct {
-	header http.Header
-	status int
-	body   bytes.Buffer
-	output *batchOutput
-	id     []byte
+	header         http.Header
+	status         int
+	body           bytes.Buffer
+	output         *batchOutput
+	id             []byte
+	call           *batchCall
+	admissionsDone <-chan struct{}
+	admitted       func()
+	admissionOnce  sync.Once
+	admissionError *batchHTTPError
+	unregistered   bool
 }
 
 func (reply *batchMemberWriter) Header() http.Header { return reply.header }
@@ -469,7 +679,33 @@ func (reply *batchMemberWriter) Write(data []byte) (int, error) {
 	if reply.status == 0 {
 		reply.status = http.StatusOK
 	}
-	if reply.status != http.StatusOK || !strings.HasPrefix(reply.header.Get("Content-Type"), "text/event-stream") {
+	if reply.status != http.StatusOK {
+		return reply.body.Write(data)
+	}
+	reply.allowAdmission()
+	select {
+	case <-reply.admissionsDone:
+	case <-reply.output.ctx.Done():
+		return 0, reply.output.ctx.Err()
+	}
+	if strings.HasPrefix(reply.header.Get("Content-Type"), "application/json") && batchFinalResponse(data) {
+		if reply.call != nil && reply.call.cancelled.Load() {
+			return len(data), nil
+		}
+		message := data
+		if reply.unregistered {
+			message = []byte(batchMethodNotFoundResponse)
+		}
+		message, err := restoreBatchResponseID(message, reply.id)
+		if err != nil {
+			return 0, reply.output.fail(err)
+		}
+		if err := reply.output.writeJSON(reply.id, message); err != nil {
+			return 0, err
+		}
+		return len(data), nil
+	}
+	if !strings.HasPrefix(reply.header.Get("Content-Type"), "text/event-stream") {
 		return reply.body.Write(data)
 	}
 	// v1.7.0 writeEvent supplies one complete SSE event in one Write call.
@@ -481,8 +717,15 @@ func (reply *batchMemberWriter) Write(data []byte) (int, error) {
 	start += len("data: ")
 	end := len(data) - 2
 	message := data[start:end]
+	final := batchFinalResponse(message)
 	// Empty-data prime/close control events are not JSON-RPC messages.
 	if len(message) != 0 {
+		if reply.call != nil && final && reply.call.cancelled.Load() {
+			return len(data), nil
+		}
+		if reply.unregistered && final {
+			message = []byte(batchMethodNotFoundResponse)
+		}
 		var err error
 		message, err = restoreBatchResponseID(message, reply.id)
 		if err != nil {
@@ -493,7 +736,7 @@ func (reply *batchMemberWriter) Write(data []byte) (int, error) {
 	event = append(event, data[:start]...)
 	event = append(event, message...)
 	event = append(event, '\n', '\n')
-	if err := reply.output.write(reply.header, event); err != nil {
+	if err := reply.output.write(reply.header, event, reply.id, final); err != nil {
 		return 0, err
 	}
 	return len(data), nil
