@@ -3,8 +3,8 @@
     "suite": "integration",
     "selection": "conformance/ci/ts-reference-selection.json"
   },
-  "scripts/fixtures/go-device-tls/behavior.test.mjs": {
+  "scripts/fixtures/go-mcp-batch/behavior.test.mjs": {
     "suite": "unit-api",
-    "selection": "scripts/fixtures/go-device-tls/behavior-plan.json"
+    "selection": "scripts/fixtures/go-mcp-batch/selection.json"
   }
 }
